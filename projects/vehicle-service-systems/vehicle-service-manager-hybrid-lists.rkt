@@ -1,0 +1,943 @@
+#lang racket
+
+#|
+Publication date: 21/04/2025
+Publication time: 11:30 a.m.
+Code version: 8.23
+Author: Ing.(C) Andrés David Rincón Salazar
+Programming language: Racket
+Language version: 8.16
+Presented to: Doctor Ricardo Moreno Laverde
+Universidad Tecnológica de Pereira
+Programa de Ingeniería de Sistemas y Computación
+Course: IS105 Programación I
+Program description: This program manages a vehicle service center's operations including product portfolio management,
+                    service vouchers creation, and invoice generation with tax calculations.
+=== CAUTIONS AND TECHNICAL CONSIDERATIONS ===
+
+1. INPUT VALIDATION:
+   - Numeric inputs must:
+     * Be positive integers (for codes/quantities)
+     * Have ≤2 decimal places (for prices, with 0.01 granularity)
+   - Dates require strict ISO 8601 format (YYYY-MM-DD)
+   - Tax IDs (NITs) must comply with country-specific validation rules
+   - Text fields (names, plates) must:
+     * Exclude special chars: <>{}[]|\\^~%
+     * Avoid format-breaking sequences: \n, \t, \\"
+
+2. ERROR HANDLING:
+   - Unhandled edge cases:
+     * File corruption during I/O operations
+     * Concurrent modification conflicts
+     * Network timeouts (if networked)
+   - Reserved error codes:
+     * -1: Product not found
+     * -2: Invalid type/format
+     * -3: Precondition violation (e.g., unordered portfolio)
+
+3. PERFORMANCE LIMITS:
+   - Not thread-safe for concurrent operations
+
+4. DEPENDENCIES:
+   - Mandatory requirements:
+     * SRFI-13 for string operations
+     * Racket ≥8.2 (uses UTF-8 exclusively)
+   - Platform-specific behaviors:
+     * File permissions follow OS defaults
+     * Little-endian systems only
+
+5. SECURITY:
+   - Critical gaps:
+     * No input sanitization for shell commands
+     * Plaintext storage of sensitive data
+   - Required mitigations for production:
+     * Encrypt voucher files at rest
+     * Validate NITs with government-approved algorithms
+
+6. INTERNATIONALIZATION:
+   - Current limitations:
+     * USD/COP currency formatting hardcoded
+     * Spanish-only UI strings
+     * American number formatting (1,000.00)
+
+7. TESTING REQUIREMENTS:
+   - Must verify:
+     * Binary search with unsorted input
+     * Invoice generation with boundary values:
+       - Subtotal: 0.01 vs. 999,999.99
+       - Tax calculations (19% vs. 20% edge cases)
+   - Stress test beyond 5,000 vouchers
+
+8. DATA MIGRATION:
+   - Backup protocol before:
+     * Racket version upgrades
+     * Schema modifications (e.g., adding VAT fields)
+   - Incompatible with:
+     * Big-endian architectures
+     * Systems without SRFI support
+
+9. AUDIT REQUIREMENTS:
+   - Mandatory logging:
+     * Portfolio changes (timestamp + user)
+     * Invoice sequence numbers (no gaps)
+   - Retention policy:
+     * 5 years for financial records
+     * 30 days for debug logs
+
+10. PERFORMANCE CHARACTERISTICS:
+    - Algorithmic complexity:
+      * Ordered insertion: O(n)
+      * Binary search: O(log n)
+    - Memory scales linearly with:
+      * Active service vouchers
+      * Product catalog size
+|#
+
+(require srfi/13) ; Required for string operations
+
+(define (main)
+;; ========================== DATA STRUCTURES =========================
+
+; Product representation as vector in list:
+; vector index 0: code (Unique numeric identifier for the product)
+; vector index 1: name (Descriptive name of the product)
+; vector index 2: value (Unit price of the product)
+
+; Service voucher representation as vector in list:
+; vector index 0: plate (Vehicle license plate)
+; vector index 1: date (Service date in YYYY-MM-DD format)
+; vector index 2: clientName (Name of the customer)
+; vector index 3: nit (Tax identification number)
+; vector index 4: codes (List of product codes included in the service)
+; vector index 5: quantities (List of quantities for each product)
+
+;; ========================== INITIAL STATE =========================
+
+; Initial empty product portfolio (now a list instead of vector)
+(define initialPortfolio '())
+
+; Initial empty voucher list (now a list instead of vector)
+(define initialVouchers '())
+
+;; ========================== AUXILIARY FUNCTIONS =========================
+
+(define (ExtractSubList sourceList startIndex endIndex)
+  ; sourceList: Original list to extract from
+  ; startIndex: Starting position (inclusive)
+  ; endIndex: Ending position (exclusive)
+  ; Returns: New list containing elements from startIndex to endIndex-1
+  (ExtractSubListAux sourceList startIndex endIndex 0 '()))
+
+(define (ExtractSubListAux sourceList startIndex endIndex currentIndex resultList)
+  ; Helper function for ExtractSubList using recursion
+  ; currentIndex: Current position in the result list
+  ; resultList: Accumulated result
+  (if (= currentIndex (- endIndex startIndex))
+      resultList
+      (ExtractSubListAux sourceList startIndex endIndex (add1 currentIndex) 
+                         (append resultList (list (list-ref sourceList (+ startIndex currentIndex)))))
+  )
+)
+
+(define (ClearInputBuffer)
+  ; Clears any remaining input in the buffer
+  ; Returns: Nothing (side effect)
+  (read-line))
+
+(define (CheckCodeExists productCode productPortfolio lowerBound upperBound)
+  ; productCode: Code to search for
+  ; productPortfolio: List of products to search in
+  ; lowerBound: Lower index for binary search
+  ; upperBound: Upper index for binary search
+  ; Returns: Boolean indicating if code exists
+  (if (>= lowerBound upperBound)
+      #f
+      (CheckCodeExistsAux productCode productPortfolio lowerBound upperBound)
+  )
+)
+
+(define (CheckCodeExistsAux productCode productPortfolio lowerBound upperBound)
+  ; First helper for binary search implementation
+  (define middlePoint (quotient (+ lowerBound upperBound) 2))
+  (if (= middlePoint (length productPortfolio))
+      #f
+      (CheckCodeExistsAux2 productCode productPortfolio lowerBound upperBound middlePoint)
+  )
+)
+
+(define (CheckCodeExistsAux2 productCode productPortfolio lowerBound upperBound middlePoint)
+  ; Second helper for binary search implementation
+  (define middleCode (vector-ref (list-ref productPortfolio middlePoint) 0))
+  (if (= productCode middleCode)
+      #t
+      (CheckCodeExistsAux3 productCode productPortfolio lowerBound upperBound middlePoint middleCode)
+  )
+)
+
+(define (CheckCodeExistsAux3 productCode productPortfolio lowerBound upperBound middlePoint middleCode)
+  ; Third helper for binary search implementation
+  (if (< productCode middleCode)
+      (CheckCodeExists productCode productPortfolio lowerBound middlePoint)
+      (CheckCodeExists productCode productPortfolio (add1 middlePoint) upperBound)
+  )
+)
+
+(define (FindProduct productCode productPortfolio lowerBound upperBound)
+  ; productCode: The code to search for
+  ; productPortfolio: List containing all available products
+  ; lowerBound: Starting index for binary search
+  ; upperBound: Ending index for binary search
+  ; Returns: Product vector or "Not found" product
+  (if (>= lowerBound upperBound)
+      (vector 0 "No encontrado" 0)
+      (FindProductAux productCode productPortfolio lowerBound upperBound)
+  )
+)
+
+(define (FindProductAux productCode productPortfolio lowerBound upperBound)
+  ; First helper for product search
+  (define middlePoint (quotient (+ lowerBound upperBound) 2))
+  (if (= middlePoint (length productPortfolio))
+      (vector 0 "No encontrado" 0)
+      (FindProductAux2 productCode productPortfolio lowerBound upperBound middlePoint)
+  )
+)
+
+(define (FindProductAux2 productCode productPortfolio lowerBound upperBound middlePoint)
+  ; Second helper for product search
+  (define middleProduct (list-ref productPortfolio middlePoint))
+  (define middleCode (vector-ref middleProduct 0))
+  (if (= productCode middleCode)
+      middleProduct
+      (FindProductAux3 productCode productPortfolio lowerBound upperBound middlePoint middleCode)
+  )
+)
+
+(define (FindProductAux3 productCode productPortfolio lowerBound upperBound middlePoint middleCode)
+  ; Third helper for product search
+  (if (< productCode middleCode)
+      (FindProduct productCode productPortfolio lowerBound middlePoint)
+      (FindProduct productCode productPortfolio (add1 middlePoint) upperBound)
+  )
+)
+
+(define (InsertInOrder newProduct productPortfolio)
+  ; newProduct: Product vector to insert
+  ; productPortfolio: Existing product list
+  ; Returns: New list with product inserted in correct position
+  (if (null? productPortfolio)
+      (list newProduct)
+      (InsertInOrderAux newProduct productPortfolio 0 '())
+  )
+)
+
+(define (InsertInOrderAux newProduct productPortfolio currentIndex resultList)
+  ; Helper for ordered insertion using recursion
+  ; currentIndex: Current position in original list
+  ; resultList: Accumulated result
+  (if (= currentIndex (length productPortfolio))
+      (append resultList (list newProduct))
+      (InsertInOrderAux2 newProduct productPortfolio currentIndex resultList)
+  )
+)
+
+(define (InsertInOrderAux2 newProduct productPortfolio currentIndex resultList)
+  ; Second helper for ordered insertion
+  (if (< (vector-ref newProduct 0) (vector-ref (list-ref productPortfolio currentIndex) 0))
+      (append resultList (list newProduct) (list-tail productPortfolio currentIndex))
+  ; else
+      (InsertInOrderAux newProduct productPortfolio (add1 currentIndex) 
+                        (append resultList (list (list-ref productPortfolio currentIndex))))
+  )
+)
+
+(define (FormatNumberWithCommas inputNumber)
+  ; inputNumber: Number to format
+  ; Returns: String with number formatted with thousands separators
+  (define numberString (number->string (exact-round inputNumber)))
+  (AddCommas numberString (string-length numberString) 0 ""))
+
+(define (AddCommas stringNumber stringLength currentPosition resultString)
+  ; Helper for number formatting
+  ; stringNumber: Original number as string
+  ; stringLength: Length of the number string
+  ; currentPosition: Current digit being processed
+  ; resultString: Accumulated result
+  (if (= currentPosition stringLength)
+      resultString
+      (AddCommasAux stringNumber stringLength currentPosition resultString)
+  )
+)
+
+(define (AddCommasAux stringNumber stringLength currentPosition resultString)
+  ; Second helper for number formatting
+  (if (and (> currentPosition 0) (= (remainder (- stringLength currentPosition) 3) 0))
+      (AddCommas stringNumber stringLength (add1 currentPosition) 
+               (string-append resultString "," (substring stringNumber currentPosition (add1 currentPosition))))
+      (AddCommas stringNumber stringLength (add1 currentPosition) 
+               (string-append resultString (substring stringNumber currentPosition (add1 currentPosition))))
+  )
+)
+
+(define (ConvertNumberToText inputNumber)
+  ; inputNumber: Number to convert to text
+  ; Returns: String with number written in Spanish words
+  (define unitWords (vector "CERO" "UN" "DOS" "TRES" "CUATRO" "CINCO" "SEIS" "SIETE" "OCHO" "NUEVE"))
+  (define tensWords (vector "DIEZ" "VEINTE" "TREINTA" "CUARENTA" "CINCUENTA" "SESENTA" "SETENTA" "OCHENTA" "NOVENTA"))
+  (define teensWords (vector "ONCE" "DOCE" "TRECE" "CATORCE" "QUINCE" "DIECISEIS" "DIECISIETE" "DIECIOCHO" "DIECINUEVE"))
+  (define hundredsWords (vector "CIENTO" "DOSCIENTOS" "TRESCIENTOS" "CUATROCIENTOS" "QUINIENTOS" 
+                                "SEISCIENTOS" "SETECIENTOS" "OCHOCIENTOS" "NOVECIENTOS"))
+  
+  ; Converts the number to exact integer (rounds if decimal)
+  (define exactNum (inexact->exact (round inputNumber)))
+  
+  (define (ConvertNumber num)
+    (cond
+      [(= num 0) ""]
+      [(< num 10) (vector-ref unitWords num)]
+      [(= num 10) "DIEZ"]
+      [(< num 20) (vector-ref teensWords (- num 11))]
+      [(< num 100)
+       (string-append
+        (vector-ref tensWords (- (quotient num 10) 1))
+        (if (> (remainder num 10) 0)
+            (string-append " Y " (ConvertNumber (remainder num 10)))
+            ""))]
+      [(= num 100) "CIEN"]
+      [(< num 1000)
+       (string-append
+        (vector-ref hundredsWords (- (quotient num 100) 1))
+        (if (> (remainder num 100) 0)
+            (string-append " " (ConvertNumber (remainder num 100)))
+            ""))]
+      [(< num 1000000)
+       (string-append
+        (ConvertNumber (quotient num 1000))
+        (if (= (quotient num 1000) 1) "" " ")
+        "MIL"
+        (if (> (remainder num 1000) 0)
+            (string-append " " (ConvertNumber (remainder num 1000)))
+            ""))]
+      [(< num 100000000)
+       (string-append
+        (ConvertNumber (quotient num 1000000))
+        (if (= (quotient num 1000000) 1) 
+            " MILLON" 
+            " MILLONES")
+        (if (> (remainder num 1000000) 0)
+            (string-append " " (ConvertNumber (remainder num 1000000)))
+            ""))]
+      [else "NUMERO DEMASIADO GRANDE"]))
+
+  (if (= exactNum 0)
+      "CERO"
+      (ConvertNumber exactNum)
+  )
+)
+
+(define (CalculateSubtotal productPortfolio productCodes productQuantities currentIndex accumulatedTotal)
+  ; productPortfolio: List of all products
+  ; productCodes: List of product codes in invoice
+  ; productQuantities: List of corresponding quantities
+  ; currentIndex: Current position being processed
+  ; accumulatedTotal: Running total of subtotal
+  ; Returns: Calculated subtotal amount
+  (if (= currentIndex (length productCodes))
+      accumulatedTotal
+      (CalculateSubtotalItem productPortfolio productCodes productQuantities currentIndex accumulatedTotal)
+  )
+)
+
+(define (CalculateSubtotalItem productPortfolio productCodes productQuantities currentIndex accumulatedTotal)
+  ; Helper for subtotal calculation
+  (define currentCode (list-ref productCodes currentIndex))
+  (define currentQuantity (list-ref productQuantities currentIndex))
+  (define currentProduct (FindProduct currentCode productPortfolio 0 (length productPortfolio)))
+  (define unitPrice (vector-ref currentProduct 2))
+  (define itemTotal (* currentQuantity unitPrice))
+  
+  (CalculateSubtotal productPortfolio productCodes productQuantities (add1 currentIndex) (+ accumulatedTotal itemTotal)))
+
+(define (PrintInvoiceItems productPortfolio productCodes productQuantities currentIndex)
+  ; productPortfolio: List of all products
+  ; productCodes: List of product codes in invoice
+  ; productQuantities: List of corresponding quantities
+  ; currentIndex: Current position being processed
+  ; Returns: Nothing (side effect of printing)
+  (if (= currentIndex (length productCodes))
+      (void)
+      (PrintCurrentInvoiceItem productPortfolio productCodes productQuantities currentIndex)
+  )
+)
+
+(define (PrintCurrentInvoiceItem productPortfolio productCodes productQuantities currentIndex)
+  ; Helper for printing invoice items
+  (define currentCode (list-ref productCodes currentIndex))
+  (define currentQuantity (list-ref productQuantities currentIndex))
+  (define currentProduct (FindProduct currentCode productPortfolio 0 (length productPortfolio)))
+  (define unitPrice (vector-ref currentProduct 2))
+  (define totalPrice (* currentQuantity unitPrice))
+  
+  (printf "│           │   ~a│ ~a│      ~a│ ~a││\n"
+          (string-pad-right (~a currentCode) 4 #\space)
+          (string-pad-right (~a (vector-ref currentProduct 1)) 48 #\space)
+          (string-pad-right (~a currentQuantity) 7 #\space)
+          (string-pad-right (~a (FormatNumberWithCommas totalPrice)) 14 #\space)
+  )
+  (printf "│           ├───────┼─────────────────────────────────────────────────┼─────────────┼───────────────┤│\n")
+  
+  (PrintInvoiceItems productPortfolio productCodes productQuantities (add1 currentIndex)))
+
+;; ========================== USER INPUT FUNCTIONS =========================
+
+(define (EnterVehiclePlate)
+  ; Prompts for and reads vehicle plate
+  ; Returns: String with plate number
+  (printf "│ PLACA: ")
+  (ClearInputBuffer)
+  (read-line))
+
+(define (EnterServiceDate)
+  ; Prompts for and reads service date
+  ; Returns: String with date in YYYY-MM-DD format
+  (printf "│ FECHA (AAAA-MM-DD): ")
+  (read-line))
+
+(define (EnterClientName)
+  ; Prompts for and reads client name
+  ; Returns: String with client name
+  (printf "│ Nombre del Cliente: ")
+  (read-line))
+
+(define (EnterClientNit)
+  ; Prompts for and reads client tax ID
+  ; Returns: String with NIT
+  (printf "│ NIT: ")
+  (read-line))
+
+(define (EnterProductCode)
+  ; Prompts for and reads product code
+  ; Returns: Numeric product code
+  (printf "│ Ingrese código de producto (0 para terminar): ")
+  (read))
+
+(define (EnterProductQuantity)
+  ; Prompts for and reads product quantity
+  ; Returns: Numeric quantity
+  (printf "│ Ingrese cantidad: ")
+  (read))
+
+(define (EnterProductName)
+  ; Prompts for and reads product name
+  ; Returns: String with product name
+  (printf "│ Ingrese el nombre del producto: ")
+  (ClearInputBuffer)
+  (read-line))
+
+(define (EnterProductValue)
+  ; Prompts for and reads product value
+  ; Returns: Numeric value
+  (printf "│ Ingrese el valor del producto: ")
+  (read))
+
+(define (EnterVoucherNumber maxVoucher)
+  ; Prompts for and reads voucher number
+  ; maxVoucher: Highest valid voucher number
+  ; Returns: Numeric voucher number
+  (printf "│ Ingrese el número de comprobante: ")
+  (read))
+
+;; ========================== DISPLAY FUNCTIONS =========================
+
+(define (DisplayMainMenu)
+  ; Displays the main menu interface
+  ; Returns: Nothing (side effect)
+  (printf "╔════════════════════════════════════════════════════════╗\n")
+  (printf "║ DIAGNOSTICENTRO EL PROGRESO         NIT. 903.103.888-2 ║\n")
+  (printf "╠════════════════════════════════════════════════════════╣\n")
+  (printf "║                MENU PRINCIPAL                          ║\n")
+  (printf "╠════════════════════════════════════════════════════════╣\n")
+  (printf "║                                                        ║\n")
+  (printf "║  0. Salir del aplicativo                               ║\n")
+  (printf "║  1. Añadir nuevos productos al portafolio              ║\n")
+  (printf "║  Comprobante de servicio a un cliente                  ║\n")
+  (printf "║    2. Crear un nuevo comprobante                       ║\n")
+  (printf "║    3. Agregar elementos a un comprobante existente     ║\n")
+  (printf "║  4. Generar e imprimir factura a un número de          ║\n")
+  (printf "║     comprobante de servicio                            ║\n")
+  (printf "║  Seleccione su opción:                                 ║\n")
+  (printf "╠════════════════════════════════════════════════════════╣\n"))
+
+(define (DisplayAddProductScreen)
+  ; Displays the product addition screen
+  ; Returns: Nothing (side effect)
+  (printf "┌─────────────────────────────────────────────────────────────────────────┐\n")
+  (printf "│       DIAGNOSTICENTRO EL PROGRESO                     NIT. 903.103.888-2│\n")
+  (printf "├─────────────────────────────────────────────────────────────────────────┤\n")
+  (printf "│                      AGREGAR NUEVO PRODUCTO                             │\n")
+  (printf "├─────────────────────────────────────────────────────────────────────────┤\n")
+  (printf "│ (Si no desea entrar nuevos productos teclee 0 en nuevo código)          │\n"))
+
+(define (DisplayPreVoucherHeader)
+  ; Displays header for voucher creation
+  ; Returns: Nothing (side effect)
+  (printf "┌───────────────────────────────────────────────────────────┐\n")
+  (printf "│ DIAGNOSTICENTRO EL PROGRESO             NIT. 903.103.888-2│\n")
+  (printf "│ INFORMACION GENERAL COMPROBANTE DE SOLICITUD DE SERVICIO: │\n")
+  (printf "├───────────────────────────────────────────────────────────┤\n"))
+
+(define (DisplayPreVoucherProductSection)
+  ; Displays product section header for voucher
+  ; Returns: Nothing (side effect)
+  (printf "├───────────────────────────────────────────────────────────┤\n")
+  (printf "│ REQUERIMIENTOS COMPROBANTE DE SOLICITUD DE SERVICIO       │\n")
+  (printf "├───────────────────────────────────────────────────────────┤\n"))
+
+(define (DisplayVoucherInfo plate date clientName nit codes quantities voucherNumber productPortfolio)
+  ; Displays complete voucher information
+  ; plate: Vehicle plate number
+  ; date: Service date
+  ; clientName: Customer name
+  ; nit: Tax ID
+  ; codes: Product codes
+  ; quantities: Product quantities
+  ; voucherNumber: Voucher identifier
+  ; productPortfolio: Product database
+  ; Returns: Nothing (side effect)
+  (printf "┌────────────────────────────────────────────────────────────────────────────────┐\n")
+  (printf "│  DIAGNOSTICENTRO EL PROGRESO                                NIT. 903.103.888-2 │\n")
+  (printf "│  COMPROBANTE DE SOLICITUD DE SERVICIO NÚMERO: ~a~a│\n" 
+          voucherNumber 
+          (make-string (- 33 (string-length (number->string voucherNumber))) #\space))
+  (printf "│ ┌─────────────────────────────────────────────────────────────────────────────┐│\n")
+  (printf "│ │PLACA: ~a~a││\n" plate (make-string (- 70 (string-length plate)) #\space))
+  (printf "│ │FECHA: ~a~a││\n" date (make-string (- 70 (string-length date)) #\space))
+  (printf "│ │Nombre del Cliente: ~a~a││\n" clientName (make-string (- 57 (string-length clientName)) #\space))
+  (printf "│ │NIT: ~a~a││\n" nit (make-string (- 72 (string-length nit)) #\space))
+  (printf "│ ├────────────┬─────────────────────────────────────────────────┬──────────────┤│\n")
+  (printf "│ │   CÓDIGO   │                     NOMBRE                      │   CANTIDAD   ││\n")
+  (printf "│ │  PRODUCTO  │                    PRODUCTO                     │              ││\n")
+  (printf "│ ├────────────┼─────────────────────────────────────────────────┼──────────────┤│\n")
+  
+  (DisplayVoucherProducts productPortfolio codes quantities 0 (length codes))
+  
+  (printf "│ └────────────┴─────────────────────────────────────────────────┴──────────────┘│\n")
+  (printf "└────────────────────────────────────────────────────────────────────────────────┘\n"))
+
+(define (DisplayVoucherProductsAux productPortfolio codes quantities currentIndex totalProducts)
+  ; Helper for displaying voucher products
+  (define product (FindProduct (list-ref codes currentIndex) productPortfolio 0 (length productPortfolio)))
+  (printf "│ │ ~a│ ~a│ ~a││\n"
+          (string-pad-right(~a (list-ref codes currentIndex)) 11 #\space)
+          (string-pad-right(~a (vector-ref product 1)) 48 #\space)
+          (string-pad-right(~a (list-ref quantities currentIndex)) 13 #\space)
+  )
+  (printf "│ ├────────────┼─────────────────────────────────────────────────┼──────────────┤│\n")
+  (DisplayVoucherProducts productPortfolio codes quantities (add1 currentIndex) totalProducts)
+)
+
+(define (DisplayVoucherProducts productPortfolio codes quantities currentIndex totalProducts)
+  ; Displays products in voucher format
+  (if (= currentIndex totalProducts)
+      (void)
+      (DisplayVoucherProductsAux productPortfolio codes quantities currentIndex totalProducts)
+  )
+)
+
+(define (DisplayProductTable productPortfolio)
+  ; Displays product portfolio in table format
+  ; Returns: Nothing (side effect)
+  (printf "┌───────┬─────────────────────────────────────────────────┬───────────────┐\n")
+  (printf "│Código │Producto                                         │Valor          │\n")
+  (printf "├───────┼─────────────────────────────────────────────────┼───────────────┤\n")
+  (DisplayProductTableRows productPortfolio 0 (length productPortfolio))
+  (printf "└───────┴─────────────────────────────────────────────────┴───────────────┘\n"))
+
+(define (DisplayProductTableRows productPortfolio currentIndex totalProducts)
+  ; Helper for displaying product table rows
+  (if (= currentIndex totalProducts)
+      (void)
+      (DisplayProductRow productPortfolio currentIndex totalProducts)))
+
+(define (DisplayProductRow productPortfolio currentIndex totalProducts)
+  ; Displays a single product row
+  (define currentProduct (list-ref productPortfolio currentIndex))
+  (printf "│   ~a│ ~a│ ~a│\n"
+          (string-pad-right (~a (vector-ref currentProduct 0)) 4 #\space)
+          (string-pad-right (~a (vector-ref currentProduct 1)) 48 #\space)
+          (string-pad-right (~a (FormatNumberWithCommas (vector-ref currentProduct 2))) 14 #\space)
+  )
+  
+  (DisplayProductTableRows productPortfolio (add1 currentIndex) totalProducts))
+
+(define (DisplayInvoiceHeader vehiclePlate serviceDate clientName clientNit)
+  ; Displays invoice header section
+  ; Returns: Nothing (side effect)
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (printf "┌────────────────────────────────────────────────────────────────────────────────────────────────────┐\n")
+  (printf "│                                                                                                    │\n")
+  (printf "│                                                                                                    │\n")
+  (printf "│           ┌───────────────────────────────────────────────────────────────────────────────────────┐│\n")
+  (printf "│           │ DIAGNOSTICENTRO EL PROGRESO                                        NIT. 903.103.888-2 ││\n")
+  (printf "│           │ Factura de venta                                        Fecha(AAAA-MM-DD): ~a ││\n" (string-pad (~a serviceDate) 10 #\space))
+  (printf "│           │ Nombre del cliente: ~a││\n"(string-pad-right (~a clientName) 66 #\space))
+  (printf "│           │ NIT del cliente: ~a││\n" (string-pad-right (~a clientNit) 69 #\space))
+  (printf "│           │ Placa: ~a││\n" (string-pad-right (~a vehiclePlate) 79 #\space))
+  (printf "│           ├───────┬─────────────────────────────────────────────────┬─────────────┬───────────────┤│\n")
+  (printf "│           │Código │Producto                                         │Cantidad     │Valor          ││\n")
+  (printf "│           ├───────┼─────────────────────────────────────────────────┼─────────────┼───────────────┤│\n"))
+
+(define (DisplayInvoiceFooter subtotalAmount taxAmount totalAmount)
+  ; Displays invoice footer with totals
+  ; Returns: Nothing (side effect)
+  (printf "│           │       │*******************FIN FACTURA*******************│*************│***************││\n")
+  (printf "│           └───────┴─────────────────────────────────────────────────┴─────────────┴───────────────┘│\n")
+  (printf "│                                                           Sub-total~a│\n" (string-pad (~a (FormatNumberWithCommas subtotalAmount)) 32 #\space))
+  (printf "│                                                            IVA(20%)~a│\n" (string-pad (~a (FormatNumberWithCommas taxAmount)) 32 #\space))
+  (printf "│                                                               Total~a│\n" (string-pad (~a (FormatNumberWithCommas totalAmount)) 32 #\space))
+  (if (> (string-length (ConvertNumberToText totalAmount)) 72)
+      (begin
+        (printf "│ Valor total a pagar: ~a      │\n" (string-pad-right (ConvertNumberToText totalAmount) 72 #\space))
+        (printf "│                      ~a│\n" (string-pad-right (string-append (substring (ConvertNumberToText totalAmount) 72 (string-length (ConvertNumberToText totalAmount))) " PESOS") 78 #\space))
+      )
+      (printf "│ Valor total a pagar: ~a│\n" (string-pad-right (string-append (ConvertNumberToText totalAmount) " PESOS") 78 #\space))
+  )
+  (printf "│                    ($~a) MCTE~a│\n" (FormatNumberWithCommas totalAmount) (make-string (- 72 (string-length (FormatNumberWithCommas totalAmount))) #\space))
+  (printf "└────────────────────────────────────────────────────────────────────────────────────────────────────┘\n"))
+
+(define (DisplayVoucherList voucherList)
+  ; Displays list of all vouchers
+  ; Returns: Nothing (side effect)
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (printf "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n")
+  (printf "│                                      LISTA DE COMPROBANTES DE SERVICIO                                           │\n")
+  (printf "├──────────┬────────────┬──────────────────────────────┬────────────────┬────────────┬────────────┬────────────────┤\n")
+  (printf "│  Placa   │   Fecha    │        Nombre Cliente        │      NIT       │Cod Producto│  Cantidad  │ Nro Comprobante│\n")
+  (printf "├──────────┼────────────┼──────────────────────────────┼────────────────┼────────────┼────────────┼────────────────┤\n")
+  (DisplayVoucherListItems voucherList 0 (length voucherList))
+  (printf "└──────────┴────────────┴──────────────────────────────┴────────────────┴────────────┴────────────┴────────────────┘\n"))
+
+(define (DisplayVoucherListItems voucherList currentIndex totalVouchers)
+  ; Helper for displaying voucher list items
+  (if (= currentIndex totalVouchers)
+      (void)
+      (begin
+        (DisplayVoucherItems (list-ref voucherList currentIndex) (add1 currentIndex))
+        (DisplayVoucherListItems voucherList (add1 currentIndex) totalVouchers))))
+
+(define (DisplayVoucherItems voucher voucherNumber)
+  ; Displays items for a single voucher
+  (DisplayVoucherItemsAux (vector-ref voucher 4) 
+                         (vector-ref voucher 5) 
+                         0 
+                         (length (vector-ref voucher 4))
+                         (vector-ref voucher 0)
+                         (vector-ref voucher 1)
+                         (vector-ref voucher 2)
+                         (vector-ref voucher 3)
+                         voucherNumber))
+
+(define (DisplayVoucherItemsAux codes quantities itemIndex totalItems plate date clientName nit voucherNumber)
+  ; Helper for displaying voucher items
+  (if (= itemIndex totalItems)
+      (void)
+      (begin
+        (printf "│ ~a│ ~a│ ~a│ ~a│ ~a│ ~a│ ~a│\n"
+                (string-pad-right (~a plate) 9 #\space)
+                (string-pad-right (~a date) 11 #\space)
+                (string-pad-right (~a clientName) 29 #\space)
+                (string-pad-right (~a nit) 15 #\space)
+                (string-pad-right (~a (list-ref codes itemIndex)) 11 #\space)
+                (string-pad-right (~a (list-ref quantities itemIndex)) 11 #\space)
+                (string-pad-right (~a voucherNumber) 15 #\space))
+        (DisplayVoucherItemsAux codes quantities (add1 itemIndex) totalItems plate date clientName nit voucherNumber))))
+
+;; ========================== MAIN FUNCTIONS =========================
+
+(define (GetVoucherProducts productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities isNewVoucher [voucherIndex -1])
+  ; Main function for collecting voucher products
+  ; productPortfolio: Current product database
+  ; voucherList: Current list of vouchers
+  ; vehiclePlate: Vehicle identifier
+  ; serviceDate: Date of service
+  ; clientName: Customer name
+  ; nit: Tax ID
+  ; productCodes: Accumulated product codes
+  ; productQuantities: Accumulated quantities
+  ; isNewVoucher: Boolean for new vs existing voucher
+  ; voucherIndex: Index for existing voucher (-1 for new)
+  ; Returns: Nothing (proceeds to next step)
+  (define currentCode (EnterProductCode))
+  (if (= currentCode 0)
+      (if isNewVoucher
+          (FinalizeNewVoucher productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities)
+          (FinalizeExistingVoucher productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities voucherIndex))
+      (ProcessProductCode productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities currentCode isNewVoucher voucherIndex)))
+
+(define (ProcessProductCode productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities currentCode isNewVoucher voucherIndex)
+  ; Processes a single product code entry
+  (if (CheckCodeExists currentCode productPortfolio 0 (length productPortfolio))
+      (ProcessValidCode productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities currentCode isNewVoucher voucherIndex)
+      (ProcessInvalidCode productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities currentCode isNewVoucher voucherIndex)))
+
+(define (ProcessValidCode productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities currentCode isNewVoucher voucherIndex)
+  ; Processes a valid product code
+  (define quantity (EnterProductQuantity))
+  (define newCodes (append productCodes (list currentCode)))
+  (define newQuantities (append productQuantities (list quantity)))
+  (GetVoucherProducts productPortfolio voucherList vehiclePlate serviceDate clientName nit newCodes newQuantities isNewVoucher voucherIndex))
+
+(define (ProcessInvalidCode productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities currentCode isNewVoucher voucherIndex)
+  ; Handles invalid product codes
+  (printf "│ Error: El código ~a no existe en el portafolio │\n" currentCode)
+  (GetVoucherProducts productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities isNewVoucher voucherIndex))
+
+(define (FinalizeVoucher productPortfolio voucherList vehiclePlate serviceDate clientName taxId productCodes productQuantities isNewVoucher)
+  ; Finalizes voucher creation/update
+  (if isNewVoucher
+      (FinalizeNewVoucher productPortfolio voucherList vehiclePlate serviceDate clientName taxId productCodes productQuantities)
+      (FinalizeExistingVoucher productPortfolio voucherList vehiclePlate serviceDate clientName taxId productCodes productQuantities)))
+
+(define (FinalizeNewVoucher productPortfolio voucherList vehiclePlate serviceDate clientName taxId productCodes productQuantities)
+  ; Completes creation of new voucher
+  ; productPortfolio: Current product database
+  ; voucherList: Current list of vouchers
+  ; vehiclePlate: Vehicle identifier
+  ; serviceDate: Date of service
+  ; clientName: Customer name
+  ; taxId: Tax identification number
+  ; productCodes: List of product codes
+  ; productQuantities: List of quantities
+  ; Returns: Nothing (proceeds to main menu)
+  (define newVoucher (vector vehiclePlate serviceDate clientName taxId productCodes productQuantities))
+  (define updatedVoucherList (append voucherList (list newVoucher)))
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (printf "┌───────────────────────────────────────────────────────────┐\n")
+  (printf "│ Comprobante generado exitosamente                         │\n")
+  (printf "└───────────────────────────────────────────────────────────┘\n")
+  (DisplayVoucherInfo (vector-ref newVoucher 0) (vector-ref newVoucher 1) (vector-ref newVoucher 2) (vector-ref newVoucher 3) (vector-ref newVoucher 4) (vector-ref newVoucher 5) (length updatedVoucherList) productPortfolio)
+  (MainMenu productPortfolio updatedVoucherList))
+
+(define (FinalizeExistingVoucher productPortfolio voucherList vehiclePlate serviceDate clientName nit productCodes productQuantities voucherIndex)
+  ; Completes update of existing voucher
+  ; voucherIndex: Position of voucher to update
+  ; Returns: Nothing (proceeds to main menu)
+  (define updatedVoucher (vector vehiclePlate serviceDate clientName nit productCodes productQuantities))
+  (define updatedVoucherList 
+    (append 
+     (ExtractSubList voucherList 0 voucherIndex)      ; Part before voucher to modify
+     (list updatedVoucher)                            ; Updated voucher
+     (ExtractSubList voucherList (add1 voucherIndex) (length voucherList)))) ; Part after
+  (printf "│ Comprobante actualizado exitosamente                                                                             │\n")
+  (printf "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n")
+  (DisplayVoucherInfo vehiclePlate serviceDate clientName nit productCodes productQuantities (add1 voucherIndex) productPortfolio)
+  (MainMenu productPortfolio updatedVoucherList))
+
+(define (AddProduct productPortfolio voucherList)
+  ; Manages product addition workflow
+  ; Returns: Nothing (proceeds to next step)
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (DisplayProductTable productPortfolio)
+  (DisplayAddProductScreen)
+  (AddProductLoop productPortfolio voucherList))
+
+(define (AddProductLoop productPortfolio voucherList)
+  ; Main loop for adding products
+  ; Returns: Nothing (proceeds to next step)
+  (printf "│ Entre un nuevo código (0 para terminar): ")
+  (define newCode (read))
+  (if (= newCode 0)
+      (begin
+        (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+        (MainMenu productPortfolio voucherList)
+      )
+      (ProcessProductCodeForAddition productPortfolio voucherList newCode)
+  )
+)
+
+(define (ProcessProductCodeForAddition productPortfolio voucherList newCode)
+  ; Processes product code during addition
+  (if (CheckCodeExists newCode productPortfolio 0 (length productPortfolio))
+      (DisplayExistingProduct productPortfolio voucherList newCode)
+      (AddNewProduct productPortfolio voucherList newCode)
+  )
+)
+
+(define (DisplayExistingProduct productPortfolio voucherList newCode)
+  ; Handles case when product code already exists
+  (define existingProduct (FindProduct newCode productPortfolio 0 (length productPortfolio)))
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (printf "┌─────────────────────────────────────────────────────────────────────────┐\n")
+  (printf "│ Este código ya existe y es:                                             │\n")
+  (printf "│ Nombre: ~a~a│\n" (vector-ref existingProduct 1) (make-string (- 64 (string-length (vector-ref existingProduct 1))) #\space))
+  (printf "│ Valor: ~a~a│\n" (vector-ref existingProduct 2) (make-string (- 65 (string-length (number->string (vector-ref existingProduct 2)))) #\space))
+  (AddProductLoop productPortfolio voucherList))
+
+(define (AddNewProduct productPortfolio voucherList newCode)
+  ; Adds new product to portfolio
+  (define newName (EnterProductName))
+  (define newValue (EnterProductValue))
+  (define newProduct (vector newCode newName newValue))
+  (define updatedPortfolio (InsertInOrder newProduct productPortfolio))
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (printf "┌─────────────────────────────────────────────────────────────────────────┐\n")
+  (printf "│ Producto agregado exitosamente                                          │\n")
+  (DisplayProductTable updatedPortfolio)
+  (AddProductLoop updatedPortfolio voucherList))
+
+(define (FillServiceVoucher productPortfolio voucherList)
+  ; Manages new voucher creation workflow
+  (printf "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+  (DisplayProductTable productPortfolio)
+  (DisplayPreVoucherHeader)
+  (define vehiclePlate (EnterVehiclePlate))
+  (define serviceDate (EnterServiceDate))
+  (define clientName (EnterClientName))
+  (define taxId (EnterClientNit))
+  (DisplayPreVoucherProductSection)
+  (GetVoucherProducts productPortfolio voucherList vehiclePlate serviceDate clientName taxId '() '() #t))
+
+(define (AddToExistingVoucherAux productPortfolio voucherList voucherNumber)
+  ; Helper for adding to existing voucher
+  (define voucherIndex (sub1 voucherNumber)) ; Convert to 0-based index
+  (define selectedVoucher (list-ref voucherList voucherIndex))
+  (DisplayProductTable productPortfolio)
+  (GetVoucherProducts productPortfolio voucherList 
+                      (vector-ref selectedVoucher 0)
+                      (vector-ref selectedVoucher 1)
+                      (vector-ref selectedVoucher 2)
+                      (vector-ref selectedVoucher 3)
+                      (vector-ref selectedVoucher 4)
+                      (vector-ref selectedVoucher 5)
+                      #f
+                      voucherIndex)) ; Pass voucher index to modify
+
+(define (AddToExistingVoucher productPortfolio voucherList)
+  ; Manages adding items to existing voucher
+  (DisplayVoucherList voucherList)
+  (printf "│ Ingrese el número de comprobante a modificar: ")
+  (define voucherNumber (read))
+  (if (or (< voucherNumber 1) (> voucherNumber (length voucherList)))
+      (begin
+        (printf "│ Número de comprobante inválido                                                                                   │\n")
+        (printf "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n")
+        (MainMenu productPortfolio voucherList))
+      (AddToExistingVoucherAux productPortfolio voucherList voucherNumber)
+  )
+)
+
+(define (GenerateInvoice productPortfolio voucherList)
+  ; Manages invoice generation workflow
+  (if (null? voucherList)
+      (GenerateInvoiceNoVouchers productPortfolio voucherList)
+      (GenerateInvoiceWithVouchers productPortfolio voucherList)
+  )
+)
+
+(define (GenerateInvoiceNoVouchers productPortfolio voucherList)
+  ; Handles case when no vouchers exist
+  (printf "┌───────────────────────────────────────────────────────────┐\n")
+  (printf "│ No hay comprobantes registrados                           │\n")
+  (printf "└───────────────────────────────────────────────────────────┘\n")
+  (MainMenu productPortfolio voucherList))
+
+(define (GenerateInvoiceWithVouchers productPortfolio voucherList)
+  ; Main invoice generation logic
+  (DisplayVoucherList voucherList)
+  (printf "┌───────────────────────────────────────────────────────────┐\n")
+  (printf "│                    GENERAR FACTURA                        │\n")
+  (printf "├───────────────────────────────────────────────────────────┤\n")
+  (printf "│ Entre el número de comprobante de servicio: ")
+  (define voucherNumber (read))
+  (if (or (< voucherNumber 1) (> voucherNumber (length voucherList)))
+      (GenerateInvoiceInvalidNumber productPortfolio voucherList)
+      (PrintInvoice productPortfolio voucherList (sub1 voucherNumber))
+  )
+)
+
+(define (GenerateInvoiceInvalidNumber productPortfolio voucherList)
+  ; Handles invalid voucher numbers
+  (printf "│ Número de comprobante inválido                            │\n")
+  (printf "└───────────────────────────────────────────────────────────┘\n")
+  (MainMenu productPortfolio voucherList))
+
+(define (PrintInvoice productPortfolio voucherList index)
+  ; Generates and displays invoice
+  (define currentVoucher (list-ref voucherList index))
+  (define vehiclePlate (vector-ref currentVoucher 0))
+  (define serviceDate (vector-ref currentVoucher 1))
+  (define clientName (vector-ref currentVoucher 2))
+  (define taxId (vector-ref currentVoucher 3))
+  (define productCodes (vector-ref currentVoucher 4))
+  (define productQuantities (vector-ref currentVoucher 5))
+  
+  (DisplayInvoiceHeader vehiclePlate serviceDate clientName taxId)
+  
+  (define subtotalAmount (CalculateSubtotal productPortfolio productCodes productQuantities 0 0))
+  (define taxAmount (* subtotalAmount 0.2))
+  (define totalAmount (+ subtotalAmount taxAmount))
+  
+  (PrintInvoiceItems productPortfolio productCodes productQuantities 0)
+  
+  (DisplayInvoiceFooter subtotalAmount taxAmount totalAmount)
+  
+  (MainMenu productPortfolio voucherList))
+
+(define (MainMenu productPortfolio voucherList)
+  ; Displays and handles main menu
+  (DisplayMainMenu)
+  (define userOption (read))
+  (if (equal? userOption 0)
+      (printf "┌───────────────────────────────────────────────────────────┐\n│ Gracias por usar el aplicativo                            │\n└───────────────────────────────────────────────────────────┘\n")
+      (ProcessOption userOption productPortfolio voucherList)
+  )
+)
+
+(define (ProcessOption userOption productPortfolio voucherList)
+  ; Processes main menu selection
+  (if (equal? userOption 1)
+      (AddProduct productPortfolio voucherList)
+      (ProcessOptionAux userOption productPortfolio voucherList)
+  )
+)
+
+(define (ProcessOptionAux userOption productPortfolio voucherList)
+  ; Secondary option processor
+  (if (equal? userOption 2)
+      (FillServiceVoucher productPortfolio voucherList)
+      (ProcessOptionAux2 userOption productPortfolio voucherList)
+  )
+)
+
+(define (ProcessOptionAux2 userOption productPortfolio voucherList)
+  ; Tertiary option processor
+  (if (equal? userOption 3)
+      (AddToExistingVoucher productPortfolio voucherList)
+      (ProcessOptionAux3 userOption productPortfolio voucherList)
+  )
+)
+
+(define (ProcessOptionAux3 userOption productPortfolio voucherList)
+  ; Final option processor
+  (if (equal? userOption 4)
+      (GenerateInvoice productPortfolio voucherList)
+      (ProcessInvalidOption productPortfolio voucherList)
+  )
+)
+
+(define (ProcessInvalidOption productPortfolio voucherList)
+  ; Handles invalid menu options
+  (printf "│ El número ingresado es incorrecto                         │\n" )
+  (printf "└───────────────────────────────────────────────────────────┘\n")
+  (MainMenu productPortfolio voucherList))
+
+(define (StartApplication)
+  ; Application entry point
+  (MainMenu initialPortfolio initialVouchers))
+
+;; Start the application
+(StartApplication)
+
+)
+
+(main)
